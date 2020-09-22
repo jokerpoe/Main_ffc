@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 import wx
 import numpy
+import numpy as np
 import cv2 as cv
 import time
 from datetime import datetime
@@ -16,16 +17,12 @@ from define import *
 from imutils import face_utils
 import math
 import imutils
-import os
-import numpy as np
-import os
 import socket
 import pygame
 import RPi.GPIO as GPIO
-###############################FLIR MODULES#######################
-import sys
-from uvctypesParabilis_v2 import *
+#############FLIR MODULES##################
 from multiprocessing  import Queue
+from uvctypesParabilis_v2 import *
 
 #*****************************
 #           GUI
@@ -41,6 +38,8 @@ import General_Globals as PG
 
 #**************************
 # Add all paths in folder
+BUF_SIZE = 2
+q = Queue(BUF_SIZE)
 Path = sys._getframe().f_code.co_filename
 Path = os.path.split(Path)[0]
 if not (Path in sys.path):
@@ -74,7 +73,8 @@ class face_recognition_app(wx.App):
                 
             ret, frame = PG.cam.read()
             frame = cv.flip(frame, 0)
-            ret2, data = PG.cam2.read()
+            #ret2, data = PG.cam2.read()
+            data = q.get(True, 500)
             data = cv.flip(data, 0)
             data2 = data
             data = cv.resize(data[:,:], (640, 480))
@@ -114,7 +114,10 @@ class face_recognition_app(wx.App):
             PG.Main_Frame.SetStatusText(str_fps,0)
             Previous_Time = time.time()
         PG.cam.release()
-        PG.cam2.release()
+        libuvc.uvc_stop_streaming(PG.devh)
+        libuvc.uvc_unref_device(PG.dev)
+        libuvc.uvc_exit(PG.ctx)
+        #PG.cam2.release()
       
         #cv.destroyAllWindows()
 class face_recognition_frame(frame_main1):
@@ -231,8 +234,8 @@ def face_recognition_name(frame, frame2):
             #color = [int(c) for c in COLORS[1]
 
             if classIDs[i] == 1 and confidences[i] >= 0.5:
-                #text = "{}".format("Masks")
-                #cv.putText(frame, text, (x + w, y + h ),cv.FONT_ITALIC  , 1.2, [255,0,0], 2)
+                text = "{}".format("Masks")
+                cv.putText(frame, text, (x + w, y + h ),cv.FONT_ITALIC  , 1.2, [255,0,0], 2)
                 cv.rectangle(frame, (x, y), (x + w, y + h), [255,255,255], 2)
                 cv.rectangle(frame, (int(x+w/2) - 20 - int(PG.values5), int(y+h/4) -20 - int(PG.values5)), (int(x+w/2) + 20  + int(PG.values5), int(y+h/4) + 20 + int(PG.values5)), [255,255,255], 2)
                 #********************
@@ -612,6 +615,15 @@ def getValueReset():
     PG.values4 = reset[4].strip('\n') #move_topbottom
     PG.values5 = reset[5].strip('\n') #zoom
     f2.close()
+def py_frame_callback(frame, userptr):
+    array_pointer = cast(frame.contents.data, POINTER(c_uint16 * (frame.contents.width * frame.contents.height)))
+    data = numpy.frombuffer(
+        array_pointer.contents, dtype=numpy.dtype(numpy.uint16)).reshape(frame.contents.height, frame.contents.width)
+    if frame.contents.data_bytes != (2 * frame.contents.width * frame.contents.height):
+        return
+    if not q.full():
+        q.put(data)
+PTR_PY_FRAME_CALLBACK = CFUNCTYPE(None, POINTER(uvc_frame), c_void_p)(py_frame_callback)
 #********************** 
 def generate_colour_map():
     colorMapType = int(PG.values2) #change
@@ -705,10 +717,67 @@ def generate_colour_map():
 
     return lut
 #*****************************
+def startStream():
+  PG.ctx = POINTER(uvc_context)()
+  PG.dev = POINTER(uvc_device)()
+  PG.devh = POINTER(uvc_device_handle)()
+  PG.ctrl = uvc_stream_ctrl()
+
+  res = libuvc.uvc_init(byref(PG.ctx), 0)
+  if res < 0:
+    print("uvc_init error")
+    #exit(1)
+
+  try:
+    res = libuvc.uvc_find_device(PG.ctx, byref(PG.dev), PT_USB_VID, PT_USB_PID, 0)
+    if res < 0:
+      print("uvc_find_device error")
+      exit(1)
+
+    try:
+      res = libuvc.uvc_open(PG.dev, byref(PG.devh))
+      if res < 0:
+        print("uvc_open error")
+        exit(1)
+
+      print("device opened!")
+
+      print_device_info(PG.devh)
+      print_device_formats(PG.devh)
+
+      frame_formats = uvc_get_frame_formats_by_guid(PG.devh, VS_FMT_GUID_Y16)
+      if len(frame_formats) == 0:
+        print("device does not support Y16")
+        exit(1)
+
+      libuvc.uvc_get_stream_ctrl_format_size(PG.devh, byref(PG.ctrl), UVC_FRAME_FORMAT_Y16,
+        frame_formats[0].wWidth, frame_formats[0].wHeight, int(1e7 / frame_formats[0].dwDefaultFrameInterval)
+      )
+
+      res = libuvc.uvc_start_streaming(PG.devh, byref(PG.ctrl), PTR_PY_FRAME_CALLBACK, None, 0)
+      if res < 0:
+        print("uvc_start_streaming failed: {0}".format(res))
+        exit(1)
+
+      print("done starting stream, displaying settings")
+      #print_shutter_info(PG.devh)
+      #print("resetting settings to default")
+      set_auto_ffc(PG.devh)
+      set_gain_high(PG.devh)
+      #print("current settings")
+      #print_shutter_info(PG.devh)
+
+    except:
+      #libuvc.uvc_unref_device(dev)
+      print('Failed to Open Device')
+  except:
+    #libuvc.uvc_exit(PG.ctx)
+    print('Failed to Find Device')
+    exit(1)
 def raw_to_8bit(data):
-  cv.normalize(data, data, 0, data.max()*2, cv.NORM_MINMAX)
-  numpy.right_shift(data, 2, data)
-  return cv.cvtColor(numpy.uint8(data), cv.COLOR_GRAY2RGB)
+  cv.normalize(data, data, 0, 65535, cv.NORM_MINMAX)
+  np.right_shift(data, 8, data)
+  return cv.cvtColor(np.uint8(data), cv.COLOR_GRAY2RGB)
   
 def ktoc(val):
     val = (round(((val - 27315) / 100.0),2))
@@ -730,6 +799,7 @@ def Check_camera_index():
     camera_id = camedid_from_file.readlines()
     #print(camedid_from_file)
     print(camera_id)
+
     camera_id1 = camera_id[0]
     if camera_id1.find('PureThermal') == -1:
         camera_thermal = 3
@@ -740,8 +810,11 @@ def Check_camera_index():
 
     index_normal_camera = camera_id[camera_webcam+1].replace('\t', '')
     index_normal_camera = index_normal_camera.replace('\n', '')
-    index_camera_thermal = camera_id[camera_thermal+1].replace('\t', '')
-    index_camera_thermal = index_camera_thermal.replace('\n', '')
+    try:
+        index_camera_thermal = camera_id[camera_thermal+1].replace('\t', '')
+        index_camera_thermal = index_camera_thermal.replace('\n', '')
+    except:
+        print('[ERR] Can not find cameras')
     return index_camera_thermal, index_normal_camera
 
 def Load_model():
@@ -784,68 +857,8 @@ def play_beep():
           
 def ctok(val):
     return (val * 100.0) + 27315
-    
-def startStream():
-  global devh
-  ctx = POINTER(uvc_context)()
-  dev = POINTER(uvc_device)()
-  devh = POINTER(uvc_device_handle)()
-  ctrl = uvc_stream_ctrl()
-
-  res = libuvc.uvc_init(byref(ctx), 0)
-  if res < 0:
-    print("uvc_init error")
-    #exit(1)
-
-  try:
-    res = libuvc.uvc_find_device(ctx, byref(dev), PT_USB_VID, PT_USB_PID, 0)
-    if res < 0:
-      print("uvc_find_device error")
-      exit(1)
-
-    try:
-      res = libuvc.uvc_open(dev, byref(devh))
-      if res < 0:
-        print("uvc_open error")
-        exit(1)
-
-      print("device opened!")
-
-      print_device_info(devh)
-      print_device_formats(devh)
-
-      frame_formats = uvc_get_frame_formats_by_guid(devh, VS_FMT_GUID_Y16)
-      if len(frame_formats) == 0:
-        print("device does not support Y16")
-        exit(1)
-
-      libuvc.uvc_get_stream_ctrl_format_size(devh, byref(ctrl), UVC_FRAME_FORMAT_Y16,
-        frame_formats[0].wWidth, frame_formats[0].wHeight, int(1e7 / frame_formats[0].dwDefaultFrameInterval)
-      )
-
-      res = libuvc.uvc_start_streaming(devh, byref(ctrl), PTR_PY_FRAME_CALLBACK, None, 0)
-      if res < 0:
-        print("uvc_start_streaming failed: {0}".format(res))
-        exit(1)
-
-      print("done starting stream, displaying settings")
-      print_shutter_info(devh)
-      print("resetting settings to default")
-      set_auto_ffc(devh)
-      set_gain_high(devh)
-      print("current settings")
-      print_shutter_info(devh)
-
-    except:
-      #libuvc.uvc_unref_device(dev)
-      print('Failed to Open Device')
-  except:
-    #libuvc.uvc_exit(ctx)
-    print('Failed to Find Device')
-    exit(1)
-
-    
 #*****************************          
+
 #       Main program
 #*****************************  
 def main():
@@ -868,20 +881,11 @@ def main():
     PG.IP_addr = get_ip_address()
     time.sleep(10)
     PG.cam = cv.VideoCapture(index_Ncamera)
-    time.sleep(2)
+    time.sleep(3)
     index_Tcamera_id = index_Tcamera.replace('/dev/video','')
-    i = 0
-    while i <=5:
-        PG.cam2 = cv.VideoCapture(int(index_Tcamera_id) + cv.CAP_V4L2)
-        res, test_Tcamera = PG.cam2.read()
-        if res:
-            break
-        else:
-            i = i + 1
-            PG.cam2.release()
-            time.sleep(1)
-    PG.cam2.set(cv.CAP_PROP_FOURCC, cv.VideoWriter_fourcc(*"Y16 "))
-    PG.cam2.set(cv.CAP_PROP_CONVERT_RGB, 0)
+    startStream()
+    #PG.cam2.set(cv.CAP_PROP_FOURCC, cv.VideoWriter_fourcc(*"Y16 "))
+    #PG.cam2.set(cv.CAP_PROP_CONVERT_RGB, 0)
     PG.cam.set(cv.CAP_PROP_BUFFERSIZE, 1)
     PG.cam.set(cv.CAP_PROP_FRAME_WIDTH,640)
     PG.cam.set(cv.CAP_PROP_FRAME_HEIGHT,480)
